@@ -84,6 +84,47 @@ export function viewURL(annotated) {
     `&subfolder=${encodeURIComponent(sub)}&type=${type}`);
 }
 
+/* ---------------------------------------------------------------- floyo
+ * Inside Floyo the editor and the machine that runs a graph are different
+ * computers. Media therefore goes to the team's storage the way Load Image
+ * sends it, is stored as '#inputs/...', and is listed in input_files so the
+ * run's machine downloads it first. */
+
+/** True inside Floyo's editor (its parent page owns uploads and storage). */
+export function onFloyo() {
+  try { return typeof window.parent?.floyo?.uploadImage === "function"; }
+  catch (e) { return false; }
+}
+
+/** A /view link whose bytes the page reads itself (waveform, video frame).
+ *  Floyo serves those from a CDN that wants the login cookie with CORS; the
+ *  extra parameter keeps that copy apart from the plain <img>/<video> one in
+ *  the browser and CDN caches, which would otherwise answer the other way. */
+export function readableURL(url) {
+  return onFloyo() ? `${url}&cors=${encodeURIComponent(location.host)}` : url;
+}
+
+/** Team id at the end of Floyo's proxy URL (".../~/<team>"). */
+export function floyoTeam() {
+  try {
+    return String(window.parent.floyo.NEXT_PUBLIC_COMFY_API_PROXY_URL || "")
+      .split("/~/").pop() || "team";
+  } catch (e) { return "team"; }
+}
+
+const FLOYO_INPUT_FILES = "__FLOYO_INPUT_FILES__";
+
+/** input_files: each file the run reads (switched-on items only, as nodes.py)
+ *  under the marker Floyo's dispatcher splits into paths to download. */
+export function inputFiles(state) {
+  let items = [];
+  try { items = JSON.parse(state || "[]"); } catch (e) { items = []; }
+  const paths = new Set((Array.isArray(items) ? items : []).filter(isOn)
+    .map((it) => String(it.file || "").replace(/ \[input\]$/, ""))
+    .filter((p) => p.startsWith("#")));
+  return paths.size ? [FLOYO_INPUT_FILES, ...paths].join("\n") : "";
+}
+
 export function fmtSpan(item) {
   const t = item.trim || {};
   const a = t.start || 0;
@@ -1005,7 +1046,10 @@ class TrimModal {
       if (!this.crop) this.crop = coverRect(item.width, item.height, opts.aspect);
     }
     this.drag = null;
-    this.canMask = item.kind === "video" && !opts.refmod && !opts.noAdd && Array.isArray(panel?.items);
+    // Masks are made by a run of their own on this computer's disk, which
+    // Floyo's editor doesn't have; off there until that runs as a Floyo job.
+    this.canMask = !onFloyo() && item.kind === "video" && !opts.refmod && !opts.noAdd &&
+      Array.isArray(panel?.items);
     injectCSS();
     this.build();
     document.body.append(this.overlay);
@@ -1250,9 +1294,19 @@ class TrimModal {
       return;
     }
     if (this.item.kind === "video") {
-      this.media = el("video", { class: "mml-tmvideo", src: url,
+      // Floyo: fetched with the cookie over CORS so Use frame may copy its
+      // pixels. Should that copy fail, play the plain one rather than show a
+      // dead player; Use frame then says it couldn't read the frame.
+      const floyo = onFloyo();
+      this.media = el("video", { class: "mml-tmvideo",
+        ...(floyo ? { crossOrigin: "use-credentials" } : {}),
+        src: floyo ? readableURL(url) : url,
         muted: false, volume: 0.9,
         playsInline: true, loop: false, preload: "auto" });
+      if (floyo) this.media.addEventListener("error", () => {
+        this.media.removeAttribute("crossorigin");
+        this.media.src = url;
+      }, { once: true });
     } else {
       this.media = el("audio", { src: url, preload: "auto" });
     }
@@ -1308,7 +1362,7 @@ class TrimModal {
    *  whatever part of the clip the timeline shows. */
   async drawWave() {
     try {
-      const resp = await fetch(viewURL(this.item.file));
+      const resp = await fetch(readableURL(viewURL(this.item.file)), { credentials: "include" });
       const buf = await resp.arrayBuffer();
       const ctx2 = new (window.AudioContext || window.webkitAudioContext)();
       const audio = await ctx2.decodeAudioData(buf);
@@ -2004,7 +2058,11 @@ class TrimModal {
     g.drawImage(v, rx, sy, sw, sh, 0, 0, sw, sh);
 
     const at = this.media.currentTime;
-    const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+    // A preview the page may not read (cross-origin) throws here; that is the
+    // same "couldn't read" case as an empty blob.
+    const blob = await new Promise((res) => {
+      try { canvas.toBlob(res, "image/png"); } catch (e) { res(null); }
+    });
     if (!blob) {
       this.modalSay("Couldn't read that frame from the preview.", true);
       return;
@@ -2020,7 +2078,7 @@ class TrimModal {
     panel.say(`Capturing frame at ${at.toFixed(2)}s\u2026`);
     panel.render();
     try {
-      const info = await uploadFile(file);
+      const info = await uploadFile(file, "picture");
       panel.items.push({
         kind: "picture",
         file: info.file,
@@ -4608,7 +4666,7 @@ function videoMenu(panel, item, e) {
   };
   const menu = el("div", { class: "mml-ctxmenu", style: { left: `${e.clientX}px`, top: `${e.clientY}px` } },
     entry("✂ Trim & crop…", "Open the editor", () => new TrimModal(panel, item)),
-    entry(item.mask ? "◐ Edit the mask…" : "◐ Mask for editing…",
+    onFloyo() ? null : entry(item.mask ? "◐ Edit the mask…" : "◐ Mask for editing…",
       "Mark part of this clip to replace, change or remove; only that area is regenerated",
       () => new TrimModal(panel, item, { mask: true })),
     item.mask && item.mask_info?.sprite
@@ -5014,6 +5072,15 @@ function sessionToken(fresh = false) {
 /** POST to one of this pack's routes with the session token attached.
  *  `init` is the usual fetch init minus `method`. */
 export async function postApi(path, init = {}) {
+  // Floyo's proxy drops the token header, and these routes work on the
+  // editor's own disk, not the team's storage. The two that make a new input
+  // file run in the page there instead; the rest can only fail.
+  if (onFloyo()) {
+    const local = FLOYO_ROUTES[path];
+    if (!local) return jsonResponse({ error: "not available on Floyo" }, 501);
+    try { return jsonResponse(await local(JSON.parse(init.body || "{}"))); }
+    catch (e) { return jsonResponse({ error: e.message }, 400); }
+  }
   const send = async (token) => api.fetchApi(path, {
     ...init, method: "POST",
     headers: { ...(init.headers || {}), [TOKEN_HEADER]: token },
@@ -5044,6 +5111,7 @@ const TOKEN_REFUSED = "ComfyUI refused this pack's session token even after fetc
   "removed on the way — open ComfyUI's own page directly and try again. The ComfyUI console says which.";
 
 async function presetApi(path, body) {
+  if (onFloyo()) return floyoPresets(path, body || {});
   const resp = body
     ? await postApi("/minimax_h3/presets" + path, {
         body: JSON.stringify(body),
@@ -5054,13 +5122,345 @@ async function presetApi(path, body) {
   return data;
 }
 
-async function uploadFile(file) {
+const byLower = (a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : a.toLowerCase() > b.toLowerCase() ? 1 : 0);
+
+/** web_api._set_digest: a media set's identity, compared for equality only. */
+async function setDigest(items) {
+  const stable = (v) => (Array.isArray(v) ? `[${v.map(stable).join(",")}]`
+    : v && typeof v === "object"
+      ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stable(v[k])}`).join(",")}}`
+      : JSON.stringify(v));
+  const rows = (Array.isArray(items) ? items : []).filter((it) => it && typeof it === "object")
+    .map((it) => {
+      const row = { kind: it.kind, file: it.file, name: it.name || it.file, enabled: it.enabled !== false };
+      if (it.kind === "video") row.audio_mode = it.audio_mode || "paired";
+      for (const k of ["trim", "crop", "size", "rotate", "mirror"]) if (it[k]) row[k] = it[k];
+      return row;
+    });
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stable(rows)));
+  return [...new Uint8Array(hash).slice(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Where a team's media presets live in its Floyo files (My Files > input).
+const PRESET_DIR = "minimax_h3/presets";
+
+/** Floyo's own file API, called the way its My Files panel calls it: same
+ *  origin, the login cookie, and the team in a header. */
+async function teamFiles(path, init = {}) {
+  const resp = await fetch(path, { ...init, headers: { ...(init.headers || {}), "x-team-id": floyoTeam() } });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw Object.assign(new Error(data.error || `request failed (${resp.status})`), { status: resp.status });
+  return data;
+}
+
+const listPresetFiles = () =>
+  teamFiles(`/api/storage/list-files/user?folderPath=${encodeURIComponent(`input/${PRESET_DIR}`)}`)
+    .then((d) => (d.files || []).filter((f) => !f.isFolder && /\.json$/i.test(f.name)))
+    .catch((e) => { if (e.status === 404) return []; throw e; });   // no preset saved yet
+
+const removeFile = (id) =>
+  teamFiles(`/api/storage/delete?itemId=${encodeURIComponent(id)}`, { method: "DELETE" })
+    .catch((e) => { if (e.status !== 404) throw e; });               // already gone is fine
+
+/** Every saved preset of the team: name -> { items, category, file, ids }.
+ *  A file that can't be read (a CDN error has no CORS header, so fetch
+ *  throws) is left out rather than failing the whole list. Should a name
+ *  ever have two files, the newest is the preset and every id is kept, so
+ *  the next save or delete clears them all. */
+async function readPresets() {
+  const all = {};
+  await Promise.all((await listPresetFiles()).map(async (f) => {
+    const rec = await fetch(readableURL(viewURL(`#inputs/${PRESET_DIR}/${f.name}`)),
+      { credentials: "include", cache: "no-store" }).then((r) => r.json()).catch(() => null);
+    if (!rec || !Array.isArray(rec.items)) return;
+    const name = rec.name || f.name.replace(/\.json$/i, "");
+    const when = Date.parse(f.lastModified) || 0, seen = all[name];
+    const ids = [...(seen?.ids || []), f.id];
+    all[name] = !seen || when >= seen.when
+      ? { items: rec.items, category: rec.category || "", file: f.name, when, ids }
+      : { ...seen, ids };
+  }));
+  return all;
+}
+
+/** Save one preset as '<name>.json', the record web_api writes. An upload
+ *  never overwrites, so the new copy lands first under a free name, then the
+ *  old copies go and the new one takes the plain name: a failure part way
+ *  leaves one readable copy. */
+async function writePreset(name, record, old) {
+  const body = new FormData();
+  body.append("image", new File([JSON.stringify({ version: 1, name, ...record }, null, 1)],
+    `${name}.json`, { type: "application/json" }));
+  body.append("subfolder", PRESET_DIR);
+  const resp = await window.parent.floyo.uploadImage(body);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `save failed (${resp.status})`);
+  for (const id of old?.ids || []) await removeFile(id);
+  const saved = String(data.name || "").split("/").pop();
+  if (saved === `${name}.json`) return;
+  const fresh = (await listPresetFiles()).find((f) => f.name === saved);
+  if (fresh) await teamFiles("/api/storage/rename", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ itemId: fresh.id, newFilename: `${name}.json` }) })
+    // the plain name taken meanwhile (another tab): the file keeps its own, and reads as `name`
+    .catch((e) => { if (e.status !== 409) throw e; });
+}
+
+/** Media presets on Floyo: files in the team's storage, so every editor
+ *  server and every teammate sees the same list, and My Files shows them. The
+ *  routes keep them in ComfyUI's user folder, which there is the disk of one
+ *  editor server. Answers what the routes answer, so the callers stay as they
+ *  are. One request at a time: a second Save while the first is still
+ *  writing would race it over the same files. */
+let presetQueue = Promise.resolve();
+export function floyoPresets(path, body = {}) {
+  const run = presetQueue.then(() => presetRequest(path, body));
+  presetQueue = run.catch(() => {});
+  return run;
+}
+
+async function presetRequest(path, body) {
+  const all = await readPresets();
+  const name = String(body.name || "").replace(/[^A-Za-z0-9 ._-]+/g, "_")
+    .replace(/^[ ._-]+|[ ._-]+$/g, "").slice(0, 80);       // web_api._preset_path
+  const names = Object.keys(all).sort(byLower);
+  const found = () => {
+    if (!all[name]) throw new Error("preset not found");
+    return all[name];
+  };
+  switch (path) {
+    case "": return {
+      presets: names.map((n) => ({
+        name: n, category: all[n].category || "", count: all[n].items.length,
+        counts: Object.fromEntries(["picture", "video", "audio"].map((k) =>
+          [k, all[n].items.filter((i) => i.kind === k && isOn(i)).length])),
+      })),
+      names,
+      categories: [...new Set(names.map((n) => all[n].category).filter(Boolean))].sort(byLower),
+    };
+    case "/save": {
+      if (!name) throw new Error("give the preset a name");
+      if (!Array.isArray(body.items)) throw new Error("items must be a list");
+      // absent category leaves the one it was filed under
+      const category = String(body.category ?? all[name]?.category ?? "").trim();
+      await writePreset(name, { items: body.items, category }, all[name]);
+      return { name, count: body.items.length, category };
+    }
+    case "/meta": {
+      const category = String(body.category || "").trim();
+      await writePreset(name, { items: found().items, category }, all[name]);
+      return { name, category };
+    }
+    case "/category": {
+      const from = String(body.from || "").trim(), to = String(body.to || "").trim();
+      if (!from) throw new Error("missing category");
+      let changed = 0;
+      for (const n of names) {
+        if ((all[n].category || "") !== from) continue;
+        await writePreset(n, { items: all[n].items, category: to }, all[n]);
+        changed += 1;
+      }
+      return { changed };
+    }
+    case "/match": {
+      const digest = await setDigest(body.items);
+      for (const n of names) if (await setDigest(all[n].items) === digest) return { name: n, digest };
+      return { name: null, digest };
+    }
+    case "/load": {
+      const { items, category } = found();
+      // nodes.py reads a missing audio_mode as "paired"; say so, as the route does
+      return { name, category: category || "", missing: [], digest: await setDigest(items),
+        items: items.map((i) => (i.kind === "video" && i.has_audio && !i.audio_mode
+          ? { ...i, audio_mode: "paired" } : i)) };
+    }
+    case "/delete":
+      for (const id of found().ids) await removeFile(id);
+      return { deleted: name };
+  }
+  throw new Error(`unknown preset request ${path}`);
+}
+
+async function uploadFile(file, kind) {
+  if (onFloyo()) return floyoUpload(file, kind);
   const body = new FormData();
   body.append("file", file, file.name);
   const resp = await postApi("/minimax_h3/upload", { body });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `upload failed (${resp.status})`);
   return data;
+}
+
+/** Upload the way Load Image does on Floyo: straight to the team's storage
+ *  (presigned, so no proxy size cap), answering what /minimax_h3/upload
+ *  answers. Floyo's /view links break on + & # %, so the name is cleaned as
+ *  web_api._safe cleans it, keeping the extension. */
+async function floyoUpload(file, kind) {
+  const dot = file.name.lastIndexOf(".");
+  const ext = dot > 0 ? file.name.slice(dot).replace(/[^.A-Za-z0-9]+/g, "") : "";
+  const stem = (dot > 0 ? file.name.slice(0, dot) : file.name)
+    .replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^[._]+|[._]+$/g, "").slice(0, 110) || "upload";
+  const info = await probeLocal(file, kind);
+  const body = new FormData();
+  body.append("image", file, stem + ext);
+  body.append("subfolder", "minimax_h3");      // a plain folder: Floyo adds '#inputs'
+  const resp = await window.parent.floyo.uploadImage(body);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `upload failed (${resp.status})`);
+  // '#inputs/minimax_h3/<name>' as stored; a name already taken comes back as 'name (1).ext'
+  const path = String(data.name || "").startsWith("#") ? data.name
+    : [data.floyoFolder || "#inputs", data.subfolder, data.name].filter(Boolean).join("/");
+  return { ...info, kind, file: path, name: path.split("/").pop(), original: file.name };
+}
+
+// Finding a soundtrack decodes the whole file in memory; above this it isn't tried.
+const PROBE_AUDIO_MAX = 200 * 1048576;
+
+/** An MP4/QuickTime file names each track's kind in an 'hdlr' box; 'soun' is
+ *  a soundtrack, whether or not this browser can decode it. */
+function declaresSound(buf) {
+  const b = new Uint8Array(buf);
+  for (let i = 0; i + 16 <= b.length; i++) {
+    if (b[i] === 0x68 && b[i + 1] === 0x64 && b[i + 2] === 0x6c && b[i + 3] === 0x72 &&        // hdlr
+        b[i + 12] === 0x73 && b[i + 13] === 0x6f && b[i + 14] === 0x75 && b[i + 15] === 0x6e)  // soun
+      return true;
+  }
+  return false;
+}
+
+/** media_io.probe's fields, read in the browser: on Floyo no ComfyUI here
+ *  ever holds the file. A video has a soundtrack when it decodes here or its
+ *  file declares one, as media_io.probe counts audio streams. */
+async function probeLocal(file, kind) {
+  const info = { duration: null, width: null, height: null, has_audio: kind === "audio" };
+  if (kind === "picture") return info;           // tiles measure pictures as they draw
+  const secs = (s) => (Number.isFinite(s) ? Math.round(s * 100) / 100 : null);
+  // Decoding gives a sound file's exact length, and rejects when a video has
+  // no soundtrack. It also works while the tab is hidden.
+  const big = file.size > PROBE_AUDIO_MAX;
+  const sound = big ? null : await new OfflineAudioContext(1, 1, 8000)
+    .decodeAudioData(await file.arrayBuffer()).catch(() => null);
+  if (kind === "video") {
+    // A codec this browser can't play (AC-3, ALAC) still decodes on the run's machine.
+    info.has_audio = !!sound || (!big && declaresSound(await file.arrayBuffer()));
+    info.audio_unchecked = big;
+  } else info.duration = secs(sound?.duration);
+  if (kind === "video" || info.duration == null) {
+    // Frame size (and a length decoding didn't give) need the file opened as
+    // media, which Chrome holds back in a hidden tab: wait for the tab rather
+    // than lose them because someone looked elsewhere mid-upload. A format
+    // this browser can't open keeps them empty, as the route's probe did.
+    if (document.hidden)
+      await new Promise((ok) => document.addEventListener("visibilitychange", ok, { once: true }));
+    const url = URL.createObjectURL(file);
+    try {
+      const m = el(kind, { preload: "metadata", muted: true, src: url });
+      await new Promise((ok) => { m.onloadedmetadata = m.onerror = ok; setTimeout(ok, 15000); });
+      info.duration = secs(m.duration) ?? info.duration ?? secs(sound?.duration);
+      if (m.videoWidth) { info.width = m.videoWidth; info.height = m.videoHeight; }
+    } finally { URL.revokeObjectURL(url); }
+  }
+  return info;
+}
+
+/* The routes that write a new input file, run in the page on Floyo: the file
+ * is made here and uploaded like any other, answering what the route does. */
+const FLOYO_ROUTES = {
+  "/minimax_h3/bake": floyoBake,
+  "/minimax_h3/extract_audio": floyoExtractAudio,
+};
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+}
+
+/** The file's own name without folder, annotation or extension. */
+function baseName(annotated) {
+  return String(annotated).split(" [")[0].split("/").pop().replace(/\.[^.]*$/, "");
+}
+
+/** web_api.bake: rotate, then mirror, then crop, then cap the long edge. */
+async function floyoBake(body) {
+  const cap = Math.max(0, parseInt(body.resize, 10) || 0);
+  const turn = (((parseInt(body.rotate, 10) || 0) % 360) + 360) % 360;
+  if (!body.file) throw new Error("no file given");
+  if (cap <= 0 && !(body.crop || body.mirror || turn))
+    throw new Error("nothing to write: set a size, crop, rotation or mirror first");
+  const img = new Image();
+  img.crossOrigin = "use-credentials";             // its pixels are read back
+  // load, not decode(): Chrome holds decode() back while the tab is hidden
+  await new Promise((ok, bad) => {
+    img.onload = ok;
+    img.onerror = () => bad(new Error("couldn't read that picture"));
+    img.src = readableURL(viewURL(body.file));
+  });
+  const was = [img.naturalWidth, img.naturalHeight];
+  const turned = Object.assign(document.createElement("canvas"),
+    turn % 180 ? { width: was[1], height: was[0] } : { width: was[0], height: was[1] });
+  const g = turned.getContext("2d");
+  g.translate(turned.width / 2, turned.height / 2);
+  if (body.mirror) g.scale(-1, 1);
+  g.rotate((turn * Math.PI) / 180);                // clockwise, as PIL's rotate(-turn)
+  g.drawImage(img, -was[0] / 2, -was[1] / 2);
+  const W = turned.width, H = turned.height;
+  let [x0, y0, x1, y1] = [0, 0, W, H];
+  const c = body.crop;
+  if (c && typeof c === "object") {
+    const x = +c.x || 0, y = +c.y || 0, w = c.w == null ? 1 : +c.w, h = c.h == null ? 1 : +c.h;
+    x0 = Math.max(0, Math.min(W - 16, Math.round(x * W)));
+    y0 = Math.max(0, Math.min(H - 16, Math.round(y * H)));
+    x1 = Math.min(W, Math.max(x0 + 16, Math.round((x + w) * W)));
+    y1 = Math.min(H, Math.max(y0 + 16, Math.round((y + h) * H)));
+  }
+  let w = x1 - x0, h = y1 - y0;
+  if (cap > 0 && Math.max(w, h) > cap) {
+    const k = cap / Math.max(w, h);
+    [w, h] = [Math.max(16, Math.round(w * k)), Math.max(16, Math.round(h * k))];
+  }
+  const out = Object.assign(document.createElement("canvas"), { width: w, height: h });
+  const og = out.getContext("2d");
+  og.imageSmoothingQuality = "high";
+  og.drawImage(turned, x0, y0, x1 - x0, y1 - y0, 0, 0, w, h);
+  const blob = await new Promise((res) => out.toBlob(res, "image/png"));
+  if (!blob) throw new Error("couldn't write the copy");
+  const info = await floyoUpload(new File([blob], `${baseName(body.file)}_${w}x${h}.png`,
+    { type: "image/png" }), "picture");
+  return { file: info.file, name: info.name, width: w, height: h, was };
+}
+
+/** web_api.extract_audio: the span as a 16-bit WAV of its own. */
+async function floyoExtractAudio(body) {
+  if (!body.file) throw new Error("no file given");
+  const start = Math.max(0, parseFloat(body.start) || 0);
+  const end = parseFloat(body.end) || 0;
+  let audio;
+  try {
+    const resp = await fetch(readableURL(viewURL(body.file)), { credentials: "include" });
+    if (!resp.ok) throw new Error(`download failed (${resp.status})`);
+    audio = await new OfflineAudioContext(1, 1, 48000).decodeAudioData(await resp.arrayBuffer());
+  } catch (e) { throw new Error(`couldn't read audio from that clip: ${e.message}`); }
+  // media_io._slice_audio's bounds
+  const rate = audio.sampleRate, chans = audio.numberOfChannels;
+  const a = Math.round(start * rate), b = end ? Math.min(audio.length, Math.round(end * rate)) : audio.length;
+  if (b <= a) throw new Error("that range is empty");
+  const data = Array.from({ length: chans }, (_, i) => audio.getChannelData(i).subarray(a, b));
+  const peak = data.reduce((m, d) => d.reduce((p, v) => Math.max(p, Math.abs(v)), m), 0);
+  const scale = peak > 1 ? 1 / peak : 1;
+  const n = b - a, wav = new DataView(new ArrayBuffer(44 + n * chans * 2));
+  const tag = (o, s) => [...s].forEach((ch, i) => wav.setUint8(o + i, ch.charCodeAt(0)));
+  tag(0, "RIFF"); wav.setUint32(4, 36 + n * chans * 2, true); tag(8, "WAVE");
+  tag(12, "fmt "); wav.setUint32(16, 16, true); wav.setUint16(20, 1, true);
+  wav.setUint16(22, chans, true); wav.setUint32(24, rate, true);
+  wav.setUint32(28, rate * chans * 2, true); wav.setUint16(32, chans * 2, true);
+  wav.setUint16(34, 16, true); tag(36, "data"); wav.setUint32(40, n * chans * 2, true);
+  for (let i = 0; i < n; i++)
+    for (let ch = 0; ch < chans; ch++)
+      wav.setInt16(44 + (i * chans + ch) * 2, Math.max(-1, Math.min(1, data[ch][i] * scale)) * 32767, true);
+  const span = start.toFixed(2).replace(".", "-");
+  const info = await floyoUpload(new File([wav.buffer], `${baseName(body.file)}_audio_${span}s.wav`,
+    { type: "audio/wav" }), "audio");
+  return { file: info.file, name: info.name, original: info.name, kind: "audio",
+    duration: info.duration, has_audio: true };
 }
 
 /** Give an item a stable id.
@@ -5691,13 +6091,14 @@ class LoaderPanel {
           `soundtracks count too — ${file.name} skipped.`, true);
         continue;
       }
-      if (guess === "video" && !caps.video) {
+      // On Floyo the run decodes videos elsewhere, so this server's PyAV says nothing.
+      if (guess === "video" && !caps.video && !onFloyo()) {
         this.say("Videos need PyAV on the server.", true);
         continue;
       }
       this.busy += 1; this.render();
       try {
-        const info = await uploadFile(file);
+        const info = await uploadFile(file, guess);
         // Don't spend an audio clip the budget can't cover — the soundtrack
         // stays available, just switched off until room is made.
         const budgetFull = audioCount(this.items) >= MAX.audio;
@@ -5715,6 +6116,9 @@ class LoaderPanel {
         if (pairable && budgetFull)
           this.say(`${info.original || info.name} loaded with its audio off — ` +
             `already using ${MAX.audio} audio clips.`, true);
+        if (info.audio_unchecked)
+          this.say(`${info.original || info.name} is too large to check for a soundtrack here, ` +
+            "so it is loaded as silent. Trim it to a shorter file to use its audio.", true);
       } catch (err) {
         this.say(`${file.name}: ${err.message}`, true);
       } finally {
@@ -5785,7 +6189,7 @@ class LoaderPanel {
   /** Prompt a Clean up once unused mask files pass the ⚙ reminder size. */
   async maskCheck() {
     const limit = cleanupMB() * 1048576;
-    if (!limit || this.store || nudgeChecking) return;
+    if (!limit || this.store || nudgeChecking || onFloyo()) return;
     nudgeChecking = true;
     try {
       const pick = await this.unusedFiles();
@@ -5944,10 +6348,12 @@ class LoaderPanel {
             onclick: () => { this.unloadPrompt = true; this.render(); } },
             "Unload media")
         : null,
-      el("button", { class: "mml-btn mml-sm",
+      // Those files sit on this server's disk; on Floyo they are the team's
+      // storage, which My Files already manages.
+      onFloyo() ? null : el("button", { class: "mml-btn mml-sm",
         title: "Delete mask files no Media Loader here uses, and saved edit latents (rebuilt when needed)",
         onclick: () => this.findCleanup() }, "Clean up\u2026"),
-      this.prefsControl(),
+      onFloyo() ? null : this.prefsControl(),
       el("span", { class: "mml-count" + (total > MAX.total ? " over" : "") },
         `${total} / ${MAX.total}`),
       el("span", { class: "mml-count" + (audioCount(this.items) > MAX.audio ? " over" : ""),
@@ -6052,6 +6458,12 @@ class LoaderPanel {
     const audio = audioCount(this.items);
     const dur = durations(this.items);
     const problems = [];
+    // Added before this loader stored media in Floyo: no run can find those files.
+    const stale = onFloyo()
+      ? this.items.filter((i) => isOn(i) && !String(i.file || "").startsWith("#")) : [];
+    if (stale.length)
+      problems.push(`${stale.map((i) => i.name).join(", ")}: not in your Floyo files. ` +
+        "Remove and add again.");
     if (total > MAX.total)
       problems.push(`Over the ${MAX.total}-file limit — remove ${total - MAX.total}.`);
     if (audio > MAX.audio)
@@ -6421,6 +6833,19 @@ app.registerExtension({
         const widget = this.addDOMWidget("mml_panel", "div", this._mmlPanel.root,
           { serialize: false });
         this._mmlWidget = widget;
+        // Floyo downloads a run's files from plain '#inputs/...' strings, and
+        // media_state keeps them inside JSON: list them where it looks. Sent
+        // with the prompt only (ComfyUI drops an input the node doesn't
+        // declare), never saved, and last so saved widget positions hold.
+        if (onFloyo()) {
+          const files = this.addWidget("text", "input_files", "", () => {});
+          files.hidden = true;
+          files.type = "hidden";
+          files.computeSize = () => [0, -4];
+          files.serialize = false;
+          files.options = { ...(files.options || {}), hidden: true };
+          files.serializeValue = () => inputFiles(w?.value);
+        }
         // A fresh node starts at the size you actually work at.
         applyStoredScale(this, { force: true });
         return r;

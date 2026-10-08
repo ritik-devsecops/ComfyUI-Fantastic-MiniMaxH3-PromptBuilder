@@ -8,10 +8,10 @@ import { api } from "../../scripts/api.js";
 import { LOADER_NAME, computeTags, viewURL as loaderViewURL,
   safeCanvasFocus, openLoaderModal, isOn, postApi, outputTargets, setterOf, linkNodes, keepNameChars,
   overlayOn, maskOverlay, refTokenEstimate, itemLook, picturePreview, clipPreview, miniPlayer, lightbox,
-  injectCSS as injectLoaderCSS } from "./medialoader.js";
+  injectCSS as injectLoaderCSS, onFloyo, floyoPresets, readableURL } from "./medialoader_floyo9.js";
 import { STACK_NAME, ENCODE_NAMES, readStack, deriveEntries, labelGroups,
   rangeText as refmodRange, previewURL as refmodPreviewURL, KIND as REFMOD_KIND,
-  openStackModal, refreshStackLabels } from "./refmodstack.js";
+  openStackModal, refreshStackLabels } from "./refmodstack_floyo9.js";
 
 const NODE_NAME = "MiniMaxH3PromptBuilder";
 
@@ -2428,6 +2428,7 @@ async function refmodPresetApi(path, body) {
 }
 
 async function presetApi(path, body) {
+  if (onFloyo()) return floyoPresets(path, body);   // the loader's own store there
   const resp = await postApi("/minimax_h3/presets" + path, {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -4882,7 +4883,7 @@ class Editor {
       }
     };
     if (cached) { if (cached.then) cached.then(paint).catch(() => {}); else paint(cached); return; }
-    const job = fetch(url)
+    const job = fetch(readableURL(url), { credentials: "include" })
       .then((r) => r.arrayBuffer())
       .then((buf) => new (window.AudioContext || window.webkitAudioContext)()
         .decodeAudioData(buf))

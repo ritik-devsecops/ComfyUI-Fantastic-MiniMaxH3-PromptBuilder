@@ -1,6 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { postApi } from "./medialoader.js";
+import { postApi } from "./medialoader_floyo9.js";
 
 /* Folder browser for MiniMax H3 Filename Prefix. Navigates the ComfyUI output
    directory server-side; the node itself only ever holds a relative path. */

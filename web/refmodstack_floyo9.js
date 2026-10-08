@@ -7,7 +7,8 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { postApi, LOADER_NAME, computeTags, viewURL, openCropEditor, keepNameChars, outputTargets, setterOf,
-         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_LINK, samCheckpoints } from "./medialoader.js";
+         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_LINK, samCheckpoints,
+         onFloyo } from "./medialoader_floyo9.js";
 
 export const STACK_NAME = "MiniMaxH3RefModStack";
 const BUILDER_NAME = "MiniMaxH3PromptBuilder";
@@ -3856,7 +3857,9 @@ export function openStackModal(node, { onClose } = {}) {
 app.registerExtension({
   name: "MiniMaxH3.RefModLibraryFromLoader",
   beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== LOADER_NAME) return;
+    // On Floyo the library lists the editor's disk while RefMods are made on
+    // the machine that runs the graph; there is no per-team store for them yet.
+    if (nodeData.name !== LOADER_NAME || onFloyo()) return;
     // A menu entry rather than a widget: the loader's panel owns its
     // layout, and the library is the one place RefMods get made.
     const prev = nodeType.prototype.getExtraMenuOptions;
